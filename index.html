@@ -345,6 +345,19 @@
   .dot.mid { background: #D08A00; }
   .dot.low { background: #B9C2D0; }
 
+  /* 同步状态指示器 */
+  .sync-indicator {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    white-space: nowrap;
+    transition: all .2s;
+    cursor: default;
+  }
+  .sync-indicator.online { background: #E8F5E9; color: #2E7D32; border: 1px solid #A5D6A7; }
+  .sync-indicator.syncing { background: #FFF3D6; color: #B26A00; border: 1px solid #E8D6A8; }
+  .sync-indicator.offline { background: #F5F5F5; color: #999; border: 1px solid #DDD; }
+
   @media (max-width: 900px) {
     .app { flex-direction: column; }
     .side-panel { position: static; max-height: none; flex: 1 1 auto; width: 100%; }
@@ -357,7 +370,10 @@
   <!-- 左：日历 -->
   <div class="calendar-panel">
     <div class="cal-header">
-      <div class="cal-title" id="calTitle">2026年9月</div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div class="cal-title" id="calTitle">2026年9月</div>
+        <span class="sync-indicator offline" id="syncIndicator" title="云端同步状态">离线</span>
+      </div>
       <div class="cal-nav">
         <button id="prevBtn">‹ 上月</button>
         <button id="todayBtn" class="btn-today">今天</button>
@@ -416,6 +432,13 @@
 // 需要固定初始月份时，在这里修改（默认自动跟随今天）
 const viewYear = null;   // 例：2026；null = 使用今天所在年份
 const viewMonth = null;  // 例：9；null  = 使用今天所在月份（1~12）
+
+// ===== Supabase 云同步配置 =====
+const SUPABASE_URL = 'https://bownwbjnmxcknsvdpvaw.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_4cBVk8neyK8T7LSoI4FZNA_upd2toP0';
+const SUPABASE_TABLE = 'tasks';
+const SYNC_USER = 'public';
+const POLL_INTERVAL = 30000; // 30秒轮询
 
 // 示例任务数据：可替换或删除（删除后 localStorage 中已有数据仍保留）
 const demoTasks = [
@@ -497,11 +520,17 @@ function holidayOf(dateStr) { return HOLIDAY_MAP[dateStr] || null; }
 
 /* ================= 数据层 ================= */
 const LS_KEY = 'calendar_todo_tasks_v1';
-let tasks = [];          // [{id, date:'YYYY-MM-DD', text, done, imp}]
+let tasks = [];          // [{id, date:'YYYY-MM-DD', text, done, imp, updated_at}]
 let curYear, curMonth;   // 当前视图年月（month: 1~12）
 let filter = 'all';
 let modalCtx = null;     // {dateStr}
 let modalImp = '中';
+
+// ===== 云同步状态 =====
+let cloudOnline = false;
+let syncing = false;
+let pushTimer = null;
+let pollTimer = null;
 
 function todayStr() {
   const t = new Date();
@@ -510,20 +539,134 @@ function todayStr() {
 function fmt(y, m, d) {
   return y + '-' + String(m).padStart(2, '0') + '-' + String(d).padStart(2, '0');
 }
+
+// ===== 云同步函数 =====
+async function cloudRequest(path, options) {
+  options = options || {};
+  const res = await fetch(SUPABASE_URL + '/rest/v1/' + path, {
+    method: options.method || 'GET',
+    headers: Object.assign({
+      'apikey': SUPABASE_KEY,
+      'Authorization': 'Bearer ' + SUPABASE_KEY,
+      'Content-Type': 'application/json',
+    }, options.headers || {}),
+    body: options.body,
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res;
+}
+
+async function pullFromCloud() {
+  try {
+    const res = await cloudRequest(
+      SUPABASE_TABLE + '?user_id=eq.' + SYNC_USER + '&order=updated_at.desc'
+    );
+    const cloudRows = await res.json();
+    if (!Array.isArray(cloudRows)) return false;
+    const cloudTasks = cloudRows.map(function(r) {
+      return { id: r.id, date: r.date, text: r.text, done: r.done,
+               imp: r.imp || '中', updated_at: r.updated_at || 0 };
+    });
+    if (cloudTasks.length > 0) {
+      // 合并：按 ID 去重，updated_at 大的优先
+      var map = {};
+      tasks.forEach(function(t) { map[t.id] = t; });
+      cloudTasks.forEach(function(t) {
+        var ex = map[t.id];
+        if (!ex || (t.updated_at || 0) >= (ex.updated_at || 0)) map[t.id] = t;
+      });
+      tasks = Object.keys(map).map(function(k) { return map[k]; });
+      localStorage.setItem(LS_KEY, JSON.stringify(tasks));
+    } else {
+      // 云端为空，本地有数据 → 推送到云端
+      var raw = localStorage.getItem(LS_KEY);
+      if (raw && JSON.parse(raw).length > 0) await pushToCloud();
+    }
+    cloudOnline = true;
+    return true;
+  } catch (e) {
+    cloudOnline = false;
+    return false;
+  }
+}
+
+async function pushToCloud() {
+  try {
+    // 查询云端已有 ID，用于删除本地已不存在的
+    var res = await cloudRequest(SUPABASE_TABLE + '?select=id&user_id=eq.' + SYNC_USER);
+    var cloudIds = (await res.json()).map(function(r) { return r.id; });
+    var localIds = tasks.map(function(t) { return t.id; });
+    var toDelete = cloudIds.filter(function(id) { return localIds.indexOf(id) === -1; });
+    if (toDelete.length > 0) {
+      await cloudRequest(SUPABASE_TABLE + '?id=in.(' + toDelete.join(',') + ')',
+        { method: 'DELETE' });
+    }
+    if (tasks.length > 0) {
+      var now = Date.now();
+      var payload = tasks.map(function(t) {
+        return { id: t.id, date: t.date, text: t.text, done: t.done,
+                 imp: t.imp || '中', updated_at: t.updated_at || now,
+                 user_id: SYNC_USER };
+      });
+      await cloudRequest(SUPABASE_TABLE, {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates' },
+        body: JSON.stringify(payload),
+      });
+    }
+    cloudOnline = true;
+    return true;
+  } catch (e) {
+    cloudOnline = false;
+    return false;
+  }
+}
+
+function updateSyncIndicator() {
+  var el = document.getElementById('syncIndicator');
+  if (!el) return;
+  if (syncing) {
+    el.textContent = '同步中…';
+    el.className = 'sync-indicator syncing';
+  } else if (cloudOnline) {
+    el.textContent = '已同步';
+    el.className = 'sync-indicator online';
+  } else {
+    el.textContent = '离线';
+    el.className = 'sync-indicator offline';
+  }
+}
+
 function load() {
   try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (raw) { tasks = JSON.parse(raw); return; }
+    var raw = localStorage.getItem(LS_KEY);
+    if (raw) { tasks = JSON.parse(raw); }
   } catch (e) {}
-  // 首次打开：装载示例数据
-  tasks = demoTasks.map((t, i) => ({ id: 'demo' + i, ...t }));
-  save();
+  if (tasks.length === 0) {
+    tasks = demoTasks.map(function(t, i) {
+      return Object.assign({ id: 'demo' + i, updated_at: Date.now() }, t);
+    });
+    localStorage.setItem(LS_KEY, JSON.stringify(tasks));
+  }
+  // 尝试从云端拉取
+  syncing = true; updateSyncIndicator();
+  pullFromCloud().then(function() {
+    syncing = false; updateSyncIndicator();
+    render();
+  });
 }
+
 function save() {
   localStorage.setItem(LS_KEY, JSON.stringify(tasks));
+  // 防抖推送云端（500ms 内多次操作合并为一次）
+  if (pushTimer) clearTimeout(pushTimer);
+  pushTimer = setTimeout(function() {
+    pushToCloud().then(function() { updateSyncIndicator(); });
+  }, 500);
 }
+
 function tasksOf(dateStr) {
-  return tasks.filter(t => t.date === dateStr);
+  return tasks.filter(function(t) { return t.date === dateStr; });
 }
 
 /* ================= 渲染：日历 ================= */
@@ -622,7 +765,7 @@ function taskEl(t) {
   el.appendChild(box);
   el.appendChild(txt);
   el.title = t.done ? '点击标记为未完成' : '点击标记为已完成';
-  el.onclick = () => { t.done = !t.done; save(); render(); };
+  el.onclick = () => { t.done = !t.done; t.updated_at = Date.now(); save(); render(); };
   return el;
 }
 
@@ -689,7 +832,7 @@ function renderSide() {
       save(); render();
     };
     row.appendChild(box); row.appendChild(txt); row.appendChild(del);
-    row.onclick = () => { t.done = !t.done; save(); render(); };
+    row.onclick = () => { t.done = !t.done; t.updated_at = Date.now(); save(); render(); };
     lastGroupEl.appendChild(row);
   });
 }
@@ -724,7 +867,7 @@ document.getElementById('modalOk').onclick = () => {
   const text = modalInput.value.trim();
   if (!text || !modalCtx) return;
   tasks.push({ id: 't' + Date.now() + Math.random().toString(16).slice(2, 6),
-               date: modalCtx.dateStr, text, done: false, imp: modalImp });
+               date: modalCtx.dateStr, text, done: false, imp: modalImp, updated_at: Date.now() });
   save(); closeModal(); render();
 };
 modalInput.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('modalOk').click(); });
@@ -735,7 +878,7 @@ function quickAdd() {
   const text = input.value.trim();
   if (!text) return;
   tasks.push({ id: 't' + Date.now() + Math.random().toString(16).slice(2, 6),
-               date: todayStr(), text, done: false, imp: '中' });
+               date: todayStr(), text, done: false, imp: '中', updated_at: Date.now() });
   input.value = '';
   save(); render();
 }
@@ -778,6 +921,13 @@ function escapeHtml(s) {
   curMonth = viewMonth || (now.getMonth() + 1);
   load();
   render();
+  // 定时轮询云端（每 30 秒拉取其他设备的更新）
+  pollTimer = setInterval(async () => {
+    var before = JSON.stringify(tasks);
+    var ok = await pullFromCloud();
+    if (ok && JSON.stringify(tasks) !== before) render();
+    updateSyncIndicator();
+  }, POLL_INTERVAL);
 })();
 </script>
 </body>
